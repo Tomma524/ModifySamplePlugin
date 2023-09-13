@@ -1,78 +1,175 @@
-﻿using Dalamud.Game.Command;
+﻿using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading.Tasks;
+using Dalamud.Game;
+using Dalamud.Game.ClientState;
+using Dalamud.Game.Command;
+using Dalamud.Game.Gui;
+using Dalamud.Hooking;
 using Dalamud.IoC;
+using Dalamud.Logging;
 using Dalamud.Plugin;
-using System.IO;
-using Dalamud.Interface.Windowing;
-using SamplePlugin.Windows;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
+using FFXIVClientStructs.FFXIV.Client.UI.Shell;
 
 namespace SamplePlugin
 {
-    public sealed class Plugin : IDalamudPlugin
-    {
-        public string Name => "Sample Plugin";
-        private const string CommandName = "/pmycommand";
+    public sealed unsafe class MacroChain : IDalamudPlugin {
 
-        private DalamudPluginInterface PluginInterface { get; init; }
-        private CommandManager CommandManager { get; init; }
-        public Configuration Configuration { get; init; }
-        public WindowSystem WindowSystem = new("SamplePlugin");
+        [PluginService] public static CommandManager CommandManager { get; private set; } = null!;
+        [PluginService] public static Framework Framework { get; private set; } = null!;
 
-        private ConfigWindow ConfigWindow { get; init; }
-        private MainWindow MainWindow { get; init; }
+        [PluginService] public static ClientState ClientState { get; private set; } = null!;
+        [PluginService] public static ChatGui Chat { get; private set; } = null!;
 
-        public Plugin(
-            [RequiredVersion("1.0")] DalamudPluginInterface pluginInterface,
-            [RequiredVersion("1.0")] CommandManager commandManager)
-        {
-            this.PluginInterface = pluginInterface;
-            this.CommandManager = commandManager;
+        public string Name => "Macro Chain";
 
-            this.Configuration = this.PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-            this.Configuration.Initialize(this.PluginInterface);
+        private delegate void MacroCallDelegate(RaptureShellModule* raptureShellModule, RaptureMacroModule.Macro* macro);
 
-            // you might normally want to embed resources and load them from the manifest stream
-            var imagePath = Path.Combine(PluginInterface.AssemblyLocation.Directory?.FullName!, "goat.png");
-            var goatImage = this.PluginInterface.UiBuilder.LoadImage(imagePath);
+        private Hook<MacroCallDelegate> macroCallHook;
+        
+        public MacroChain() {
+            macroCallHook = Hook<MacroCallDelegate>.FromAddress(new IntPtr(RaptureShellModule.MemberFunctionPointers.ExecuteMacro), MacroCallDetour);
+            macroCallHook?.Enable();
 
-            ConfigWindow = new ConfigWindow(this);
-            MainWindow = new MainWindow(this, goatImage);
-            
-            WindowSystem.AddWindow(ConfigWindow);
-            WindowSystem.AddWindow(MainWindow);
-
-            this.CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
-            {
-                HelpMessage = "A useful message to display in /xlhelp"
+            CommandManager.AddHandler("/nextmacro", new Dalamud.Game.Command.CommandInfo(OnMacroCommandHandler) {
+                HelpMessage = "Executes the next macro.",
+                ShowInHelp = true
+            });
+            CommandManager.AddHandler("/runmacro", new Dalamud.Game.Command.CommandInfo(OnRunMacroCommand) {
+                HelpMessage = "Execute a macro (Not usable inside macros). - /runmacro ## [individual|shared].",
+                ShowInHelp = true
             });
 
-            this.PluginInterface.UiBuilder.Draw += DrawUI;
-            this.PluginInterface.UiBuilder.OpenConfigUi += DrawConfigUI;
+            Framework.Update += FrameworkUpdate;
         }
 
-        public void Dispose()
-        {
-            this.WindowSystem.RemoveAllWindows();
-            
-            ConfigWindow.Dispose();
-            MainWindow.Dispose();
-            
-            this.CommandManager.RemoveHandler(CommandName);
+        public void Dispose() {
+            CommandManager.RemoveHandler("/nextmacro");
+            CommandManager.RemoveHandler("/runmacro");
+            macroCallHook?.Disable();
+            macroCallHook?.Dispose();
+            macroCallHook = null;
+            Framework.Update -= FrameworkUpdate;
         }
 
-        private void OnCommand(string command, string args)
-        {
-            // in response to the slash command, just display our main ui
-            MainWindow.IsOpen = true;
+        private RaptureMacroModule.Macro* lastExecutedMacro = null;
+        private RaptureMacroModule.Macro* nextMacro = null;
+        private RaptureMacroModule.Macro* downMacro = null;
+        private readonly Stopwatch paddingStopwatch = new Stopwatch();
+
+        private void MacroCallDetour(RaptureShellModule* raptureShellModule, RaptureMacroModule.Macro* macro) {
+            macroCallHook?.Original(raptureShellModule, macro);
+            if (RaptureShellModule.Instance->MacroLocked) return;
+            lastExecutedMacro = macro;
+            nextMacro = null;
+            downMacro = null;
+            if (lastExecutedMacro == RaptureMacroModule.Instance->Individual[99] || lastExecutedMacro == RaptureMacroModule.Instance->Shared[99]) {
+                return;
+            }
+
+            nextMacro = macro + 1;
+            for (var i = 90; i < 100; i++) {
+                if (lastExecutedMacro == RaptureMacroModule.Instance->Individual[i] || lastExecutedMacro == RaptureMacroModule.Instance->Shared[i]) {
+                    return;
+                }
+            }
+
+            downMacro = macro + 10;
+        }
+        
+        public void OnMacroCommandHandler(string command, string args) {
+            try {
+                if (lastExecutedMacro == null) {
+                    Chat.PrintError("No macro is running.");
+                    return;
+                }
+
+                if (args.ToLower() == "down") {
+                    if (downMacro != null) {
+                        RaptureShellModule.Instance->MacroLocked = false;
+                        RaptureShellModule.Instance->ExecuteMacro(downMacro);
+                    } else {
+                        Chat.PrintError("Can't use `/nextmacro down` on macro 90+");
+                    }                    
+                } else if (args.ToLower() == "self") {
+                    RaptureShellModule.Instance->MacroLocked = false;
+                    RaptureShellModule.Instance->ExecuteMacro(lastExecutedMacro);
+                } else if (int.Parse(args.ToLower()) >= 1 && int.Parse(args.ToLower()) < 100) {
+                    RaptureShellModule.Instance->MacroLocked = false;
+                    RaptureShellModule.Instance->ExecuteMacro(RaptureMacroModule.Instance->Individual[int.Parse(args.ToLower())]);
+                } else {
+                    if (nextMacro != null) {
+                        RaptureShellModule.Instance->MacroLocked = false;
+                        RaptureShellModule.Instance->ExecuteMacro(nextMacro);
+                    } else {
+                        Chat.PrintError("Can't use `/nextmacro` on macro 99.");
+                    }                    
+                }
+                RaptureShellModule.Instance->MacroLocked = false;
+                
+                
+            } catch (Exception ex) {
+                PluginLog.LogError(ex.ToString());
+            }
         }
 
-        private void DrawUI()
-        {
-            this.WindowSystem.Draw();
+        public void FrameworkUpdate(Framework framework) {
+            if (lastExecutedMacro == null) return;
+            if (ClientState == null) return;
+            if (!ClientState.IsLoggedIn) {
+                lastExecutedMacro = null;
+                paddingStopwatch.Stop();
+                paddingStopwatch.Reset();
+                return;
+            }
+            if (RaptureShellModule.Instance->MacroCurrentLine >= 0) {
+                paddingStopwatch.Restart();
+                return;
+            }
+
+            if (paddingStopwatch.ElapsedMilliseconds > 2000) {
+                lastExecutedMacro = null;
+                paddingStopwatch.Stop();
+                paddingStopwatch.Reset();
+            }
         }
 
-        public void DrawConfigUI()
-        {
-            ConfigWindow.IsOpen = true;
+        public void OnRunMacroCommand(string command, string args) {
+            try {
+                if (lastExecutedMacro != null) {
+                    Chat.PrintError("/runmacro is not usable while macros are running. Please use /nextmacro");
+                    return;
+                }
+                var argSplit = args.Split(' ');
+                var num = byte.Parse(argSplit[0]);
+
+                if (num > 99) {
+                    Chat.PrintError("Invalid Macro number.\nShould be 0 - 99");
+                    return;
+                }
+
+                var shared = false;
+                foreach (var arg in argSplit.Skip(1)) {
+                    switch (arg.ToLower()) {
+                        case "shared":
+                        case "share":
+                        case "s": {
+                            shared = true;
+                            break;
+                        }
+                        case "individual":
+                        case "i": {
+                            shared = false;
+                            break;
+                        }
+                    }
+                }
+                RaptureShellModule.Instance->ExecuteMacro((shared ? RaptureMacroModule.Instance->Shared : RaptureMacroModule.Instance->Individual)[num]);
+            } catch (Exception ex) {
+                PluginLog.LogError(ex.ToString());
+            }
         }
     }
 }

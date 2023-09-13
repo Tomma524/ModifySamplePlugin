@@ -1,9 +1,9 @@
 {
-  "Author": "your name here",
-  "Name": "Sample Plugin",
-  "Punchline": "A short one-liner that shows up in /xlplugins.",
+  "Author": "Toma(Original:Caraxi)",
+  "Name": "MacroChainVerToma",
+  "Punchline": "Run multiple macros one after the other.",
   "Description": "A description that shows up in /xlplugins. List any major slash-command(s).",
-  "InternalName": "samplePlugin",
+  "InternalName": "MacroChainVerToma",
   "ApplicableVersion": "any",
   "Tags": [
     "sample",
